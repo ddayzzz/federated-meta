@@ -17,6 +17,14 @@ class UsingAllDataClient(BaseClient):
     def create_data_loader(self, dataset):
         return None
 
+    def solve_epochs(self, round_i, client_id, data_loader, optimizer, num_epochs, hide_output: bool = False):
+        data_loader = self.all_dataset_loader
+        return super(UsingAllDataClient, self).solve_epochs(round_i, client_id, data_loader, optimizer, num_epochs, hide_output)
+
+    def test(self, data_loader):
+        data_loader = self.all_dataset_loader
+        return super(UsingAllDataClient, self).test(data_loader)
+
 
 class FedAvgAdv(BaseFedarated):
 
@@ -31,6 +39,7 @@ class FedAvgAdv(BaseFedarated):
         a = '[train_test_split]'
         if self.use_all_data:
             a += '_[use_all_data]'
+            print('FedAvgAdv use all data for each client')
         super(FedAvgAdv, self).__init__(options=options, read_dataset=read_dataset, model=model, append2metric=a, more_metric_to_train=more_metric_to_train)
         #
         self.split_train_validation_test_clients()
@@ -60,7 +69,7 @@ class FedAvgAdv(BaseFedarated):
         users, groups, train_data, test_data = dataset
         if len(groups) == 0:
             groups = [None for _ in users]
-        dataset_wrapper = MiniDataset
+        dataset_wrapper = self.choose_dataset_wapper()
         all_clients = []
         for user, group in zip(users, groups):
             # if isinstance(user, str) and len(user) >= 5:

@@ -7,9 +7,15 @@ from torch import nn, optim
 import pandas as pd
 from clients.base_client import BaseClient
 from utils.metrics import Metrics
-from utils.data_utils import MiniDataset
 from utils.flops_counter import get_model_complexity_info
 
+
+from utils.data_utils import MiniDataset
+from dataset.shakespeare.shakespeare import Shakespeare
+
+DATASET_WRAPPER = {
+    'shakespeare': Shakespeare
+}
 
 
 class BaseFedarated(abc.ABC):
@@ -25,10 +31,10 @@ class BaseFedarated(abc.ABC):
         :param worker: Worker 实例
         :param append2metric: 自定义metric
         """
+        self.options = options
         self.model = self.setup_model(options=options, model=model)
         self.device = options['device']
         # 记录总共的训练数据
-        self.options = options
         self.clients = self.setup_clients(dataset=read_dataset, model=model)
         self.num_epochs = options['num_epochs']
         self.num_rounds = options['num_rounds']
@@ -53,11 +59,20 @@ class BaseFedarated(abc.ABC):
             get_model_complexity_info(model, input_shape, input_type=input_type, device=dev)
         return model
 
+    def choose_dataset_wapper(self):
+        # 读取数据集
+        idx = self.options['dataset'].find("_")
+        if idx != -1:
+            dataset_name, sub_data = self.options['dataset'][:idx], self.options['dataset'][idx + 1:]
+        else:
+            dataset_name, sub_data = self.options['dataset'], None
+        return DATASET_WRAPPER.get(dataset_name, MiniDataset)
+
     def setup_clients(self, dataset, model):
         users, groups, train_data, test_data = dataset
         if len(groups) == 0:
             groups = [None for _ in users]
-        dataset_wrapper = MiniDataset
+        dataset_wrapper = self.choose_dataset_wapper()
         all_clients = []
         for user, group in zip(users, groups):
             # if isinstance(user, str) and len(user) >= 5:

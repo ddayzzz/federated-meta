@@ -118,6 +118,6 @@ if __name__ == '__main__':
         print('Usage: {0} <p>'.format(sys.argv[0]))
         exit(0)
     p = float(sys.argv[1])
-    d = os.path.join(PROJECT_DIR, 'leaf', 'data', 'femnist', 'data', 'train')
-    t = os.path.join(PROJECT_DIR, 'leaf', 'data', 'femnist', 'data', 'test')
+    d = os.path.join(PROJECT_DIR, 'leaf', 'data', 'shakespeare', 'data', 'train')
+    t = os.path.join(PROJECT_DIR, 'leaf', 'data', 'shakespeare', 'data', 'test')
     split_to_support_query(d, t, p)

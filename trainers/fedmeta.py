@@ -54,6 +54,7 @@ class Client(BaseClient):
     def __init__(self, id, train_dataset, test_dataset, options, optimizer, model, model_flops, model_bytes):
         # 这里的 model 即为 MAML 封装的对象
         self.meta_inner_step = options['meta_inner_step']
+        self.store_to_cpu = options['store_to_cpu']
         super(Client, self).__init__(id, train_dataset, test_dataset, options, optimizer, model, model_flops, model_bytes)
         if self.is_mini_batch:
             self.train_dataset_loader_iterator = self.generate_batch_generator(self.train_dataset_loader)
@@ -75,7 +76,10 @@ class Client(BaseClient):
 
     def get_parameters_list(self) -> list:
         with torch.no_grad():
-            ps = [p.data.clone().detach() for p in self.model.parameters()]
+            if self.store_to_cpu:
+                ps = [p.data.cpu() for p in self.model.parameters()]
+            else:
+                ps = [p.data.clone().detach() for p in self.model.parameters()]
         return ps
 
     def count_correct(self, preds, targets):
@@ -135,7 +139,79 @@ class Client(BaseClient):
         # self.optimizer.zero_grad()
         mean_loss.backward()
         # 获取此使的梯度, 这个梯度为一个 tensor
-        grads = [p.grad.data.clone().detach() for p in self.model.parameters()]
+        if self.store_to_cpu:
+            grads = [p.grad.data.cpu() for p in self.model.parameters()]
+        else:
+            grads = [p.grad.data.clone().detach() for p in self.model.parameters()]
+        for p in self.model.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
+        #
+
+        comp = (spt_sz + qry_sz) * self.flops
+        bytes_w = self.model_bytes
+        bytes_r = self.model_bytes
+        flop_stats = {'id': self.id, 'bytes_w': bytes_w, 'comp': comp, 'bytes_r': bytes_r}
+
+        return {
+            'support_loss_sum': np.dot(support_loss, support_num_sample),
+            'query_loss_sum': np.dot(query_loss, query_num_sample),
+            'support_correct': np.sum(support_correct),
+            'query_correct': np.sum(query_correct),
+            'support_num_samples': spt_sz,
+            'query_num_samples': qry_sz,
+        }, flop_stats, grads
+
+    def solve_meta_one_epoch_save_gpu_memory(self):
+        if self.is_mini_batch:
+            support_data_loader = self.gen_train_batchs()
+            query_data_loader = self.gen_test_batchs()
+        else:
+            query_data_loader = self.test_dataset_loader
+            support_data_loader = self.train_dataset_loader
+
+        self.model.train()
+        # 克隆之后, learn 为中间节点, 本身不带有梯度
+        learner = self.model.clone()
+        with torch.backends.cudnn.flags(enabled=False):
+            # 记录相关的信息
+            support_loss, support_correct, support_num_sample = [], [], []
+            for batch_idx, (x, y) in enumerate(support_data_loader):
+                x, y = x.to(self.device), y.to(self.device)
+                num_sample = y.size(0)
+                pred = learner(x)
+                loss = self.criterion(pred, y)
+                # 评估
+                correct = self.count_correct(pred, y)
+                # 写入相关的记录, 这份 loss 是平均的
+                support_loss.append(loss.item())
+                support_correct.append(correct)
+                support_num_sample.append(num_sample)
+                # 计算 loss 关于当前参数的导数, 并更新目前网络的参数(回传到 model)
+                learner.adapt(loss)
+
+            # 此使的参数基于 query
+            query_loss, query_correct, query_num_sample = [], [], []
+            for batch_idx, (x, y) in enumerate(query_data_loader):
+                x, y = x.to(self.device), y.to(self.device)
+                num_sample = y.size(0)
+                pred = learner(x)
+                loss = self.criterion(pred, y)
+                # batch_sum_loss
+                # 评估
+                correct = self.count_correct(pred, y)
+                # 写入相关的记录, 这份 loss 是平均的
+                query_loss.append(loss.item())
+                query_correct.append(correct)
+                query_num_sample.append(num_sample)
+                #
+                (loss * num_sample).backward()
+
+        spt_sz = np.sum(support_num_sample)
+        qry_sz = np.sum(query_num_sample)
+
+        # 获取此使的梯度, 这个梯度为一个 tensor
+        grads = [p.grad.data.cpu() / qry_sz for p in self.model.parameters()]
         for p in self.model.parameters():
             if p.grad is not None:
                 p.grad.zero_()
@@ -239,13 +315,17 @@ class FedMeta(BaseFedarated):
         self.outer_lr = options['outer_lr']
         self.meta_inner_step = options['meta_inner_step']
         self.meta_train_test_split = options['meta_train_test_split']
+        self.store_to_cpu = options['store_to_cpu']
         self.outer_opt = Adam(lr=self.outer_lr)
 
         if self.meta_inner_step <= 0:
             print('>>> Using FedMeta')
         else:
             print('>>> Using FedMeta, meta-train inner step: ', self.meta_inner_step)
-        a = f'outerlr[{self.outer_lr}]_metaalgo[{self.meta_algo}]_minibatch[{int(self.meta_inner_step > 0)}]'
+        if self.meta_inner_step > 0:
+            a = f'outerlr[{self.outer_lr}]_metaalgo[{self.meta_algo}]_minibatch[{self.meta_inner_step}]'
+        else:
+            a = f'outerlr[{self.outer_lr}]_metaalgo[{self.meta_algo}]'
         self.maml = MAML(lr=options['lr'], model=model.to(options['device']))
         super(FedMeta, self).__init__(options=options, model=self.maml, read_dataset=read_dataset, append2metric=a,
                                       more_metric_to_train=['query_acc', 'query_loss'])
@@ -289,7 +369,7 @@ class FedMeta(BaseFedarated):
         users, groups, train_data, test_data = dataset
         if len(groups) == 0:
             groups = [None for _ in users]
-        dataset_wrapper = MiniDataset
+        dataset_wrapper = self.choose_dataset_wapper()
         all_clients = []
         for user, group in zip(users, groups):
             # if isinstance(user, str) and len(user) >= 5:
@@ -353,7 +433,10 @@ class FedMeta(BaseFedarated):
         for c in clients:
             c.set_parameters_list(self.latest_model)
             # 保存信息
-            stat, flop_stat, grads = c.solve_meta_one_epoch()
+            if self.store_to_cpu:
+                stat, flop_stat, grads = c.solve_meta_one_epoch_save_gpu_memory()
+            else:
+                stat, flop_stat, grads = c.solve_meta_one_epoch()
             # 总共正确的个数
             spt_corrects += stat['support_correct']
             qry_corrects += stat['query_correct']

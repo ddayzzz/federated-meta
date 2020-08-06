@@ -9,7 +9,7 @@ MODEL_CONFIG = {
     'mnist.logistic': {'out_dim': 10, 'in_dim': 784},
     'femnist.cnn': {'num_classes': 62, 'image_size': 28},
     'omniglot.cnn': {'num_classes': 5, 'image_size': 28},
-    'shakespeare.stackled_lstm': {'seq_len': 80, 'num_classes': 80, 'num_hidden': 256, }
+    'shakespeare.stacked_lstm': {'seq_len': 80, 'num_classes': 80, 'num_hidden': 256, }
 }
 
 
@@ -118,6 +118,7 @@ def add_dynamic_options(argparser):
         argparser.add_argument('--outer_lr', help='更新元学习中的外部学习率', type=float, required=True)
         argparser.add_argument('--meta_inner_step', type=int, default=0)
         argparser.add_argument('--meta_train_test_split', type=int, default=-1)
+        argparser.add_argument('--store_to_cpu', action='store_true', default=False)
     elif algo == 'fedavg_adv':
         argparser.add_argument('--use_all_data', action='store_true', default=False)
     return argparser
