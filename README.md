@@ -1,5 +1,5 @@
 # Federated Meta-Learning with Fast Convergence and Efficient Communication
-This repo contains of Pytorch implement of paper [Federated Meta-Learning with Fast Convergence and Efficient Communication](https://arxiv.org/abs/1802.07876)
+This repo contains unofficial pytorch implement of paper [Federated Meta-Learning with Fast Convergence and Efficient Communication](https://arxiv.org/abs/1802.07876)
 Due to lack of official codes, I am confused with such statements placed in the paper:
 
 Page 6:
@@ -27,13 +27,13 @@ To split a client's data, you can go to `dataset/<dataset_name>` folder and run 
 
 # Experiments
 
-FedMeta supports two schemes for Algorithm 1:
+Both FedAvg and FedMeta support two schemes for Algorithm 1:
 
-1. Sampling mini-batch(s) from support set and query set from both meta-train and meta-test clients when training or testing. It is same as do in meta-learning.
+1. Sampling mini-batch(s) from support set and query set from both meta-train and meta-test clients when training or testing. It is same as what we do in meta-learning.
 
 2. Use full data of support and query set.
 
-You can use `meta_inner_step` option to specify the number of mini-batch(s)(default is `0`, for scheme 1 otherwise scheme 2).
+You can use `train_inner_step` and `test_inner_step` option to specify the number of mini-batch(s)(default is `0` which means use full dataset).
 
 
 ### For FEMNIST
@@ -76,6 +76,19 @@ FedAvg:
 --save_every=1000 \
 ```
 Note that it different from FedAvg because of clients are divided into meta-train and meta-test tasks.
+
+I ran the FedAvg based on difference schemes(Red one is scheme 2, green one is scheme 1):
+
+Accuracy|Loss
+|-|-
+![](assets/fedavg_adv_acc.jpg)|![](assets/fedavg_adv_loss.jpg)
+
+Contrast to FedAvg, FedMeta use train dataset as support set and test dataset as query set. The red one uses 5 mini-batches during inner loop and outer loop.
+Accuracy|Loss
+|-|-
+![](assets/fedmeta_acc.jpg)|![](assets/fedmeta_loss.jpg)
+
+**Note** I can't achieve the same performance!!! I hope the author can share their implementation :)
 
 # TO-DO
 

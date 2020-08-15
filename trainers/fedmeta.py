@@ -4,8 +4,8 @@ from trainers.fedbase import BaseFedarated, MiniDataset
 import pandas as pd
 import numpy as np
 from utils.flops_counter import get_model_complexity_info
-from learn2learn.algorithms.maml import MAML
-from learn2learn.algorithms.meta_sgd import MetaSGD
+# from learn2learn.algorithms.maml import MAML
+# from learn2learn.algorithms.meta_sgd import MetaSGD
 
 
 class Adam:
@@ -53,16 +53,9 @@ class Client(BaseClient):
 
     def __init__(self, id, train_dataset, test_dataset, options, optimizer, model, model_flops, model_bytes):
         # 这里的 model 即为 MAML 封装的对象
-        self.meta_inner_step = options['meta_inner_step']
-        self.store_to_cpu = options['store_to_cpu']
+        # self.store_to_cpu = options['store_to_cpu']
         super(Client, self).__init__(id, train_dataset, test_dataset, options, optimizer, model, model_flops, model_bytes)
-        if self.is_mini_batch:
-            self.train_dataset_loader_iterator = self.generate_batch_generator(self.train_dataset_loader)
-            self.test_dataset_loader_iterator = self.generate_batch_generator(self.test_dataset_loader)
-
-    @property
-    def is_mini_batch(self):
-        return self.meta_inner_step > 0
+        self.inner_lr = options['lr']
 
     def set_parameters_list(self, params_list: list):
         """
@@ -76,10 +69,7 @@ class Client(BaseClient):
 
     def get_parameters_list(self) -> list:
         with torch.no_grad():
-            if self.store_to_cpu:
-                ps = [p.data.cpu() for p in self.model.parameters()]
-            else:
-                ps = [p.data.clone().detach() for p in self.model.parameters()]
+            ps = [p.data.clone().detach() for p in self.model.parameters()]
         return ps
 
     def count_correct(self, preds, targets):
@@ -88,22 +78,32 @@ class Client(BaseClient):
         return correct
 
     def solve_meta_one_epoch(self):
-        if self.is_mini_batch:
-            support_data_loader = self.gen_train_batchs()
-            query_data_loader = self.gen_test_batchs()
+        if self.is_train_mini_batch:
+            if self.same_mini_batch:
+                support_data_loader = self.gen_train_batchs_use_same_batch()
+            else:
+                support_data_loader = self.gen_train_batchs()
+        else:
+            support_data_loader = self.train_dataset_loader
+
+        if self.is_test_mini_batch:
+            if self.same_mini_batch:
+                query_data_loader = self.gen_test_batchs_use_same_batch()
+            else:
+                query_data_loader = self.gen_test_batchs()
         else:
             query_data_loader = self.test_dataset_loader
-            support_data_loader = self.train_dataset_loader
 
         self.model.train()
         # 克隆之后, learn 为中间节点, 本身不带有梯度
-        learner = self.model.clone()
+
         # 记录相关的信息
         support_loss, support_correct, support_num_sample = [], [], []
+        loss_sum = 0.0
         for batch_idx, (x, y) in enumerate(support_data_loader):
             x, y = x.to(self.device), y.to(self.device)
             num_sample = y.size(0)
-            pred = learner(x)
+            pred = self.model(x)
             loss = self.criterion(pred, y)
             # 评估
             correct = self.count_correct(pred, y)
@@ -112,7 +112,14 @@ class Client(BaseClient):
             support_correct.append(correct)
             support_num_sample.append(num_sample)
             # 计算 loss 关于当前参数的导数, 并更新目前网络的参数(回传到 model)
-            learner.adapt(loss)
+            loss_sum += loss * num_sample
+        grads = torch.autograd.grad(loss_sum / sum(support_num_sample), list(self.model.parameters()), create_graph=True, retain_graph=True)
+        for p, g in zip(self.model.parameters(), grads):
+            p.data.add_(g.data, alpha=-self.inner_lr)
+
+        for p in self.model.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
 
         # 此使的参数基于 query
         query_loss, query_correct, query_num_sample = [], [], []
@@ -120,7 +127,7 @@ class Client(BaseClient):
         for batch_idx, (x, y) in enumerate(query_data_loader):
             x, y = x.to(self.device), y.to(self.device)
             num_sample = y.size(0)
-            pred = learner(x)
+            pred = self.model(x)
             loss = self.criterion(pred, y)
             # batch_sum_loss
             # 评估
@@ -134,15 +141,10 @@ class Client(BaseClient):
 
         spt_sz = np.sum(support_num_sample)
         qry_sz = np.sum(query_num_sample)
-        mean_loss = loss_sum / qry_sz
         # 这个优化器的唯一作用是清除网络多余的梯度信息
         # self.optimizer.zero_grad()
-        mean_loss.backward()
         # 获取此使的梯度, 这个梯度为一个 tensor
-        if self.store_to_cpu:
-            grads = [p.grad.data.cpu() for p in self.model.parameters()]
-        else:
-            grads = [p.grad.data.clone().detach() for p in self.model.parameters()]
+        grads = torch.autograd.grad(loss_sum / qry_sz, list(self.model.parameters()))
         for p in self.model.parameters():
             if p.grad is not None:
                 p.grad.zero_()
@@ -232,17 +234,32 @@ class Client(BaseClient):
         }, flop_stats, grads
 
 
-    def test_meta_one_epoch(self, train_loader, test_loader):
+    def test_meta_one_epoch(self):
+        if self.is_train_mini_batch:
+            if self.same_mini_batch:
+                support_data_loader = self.gen_train_batchs_use_same_batch()
+            else:
+                support_data_loader = self.gen_train_batchs()
+        else:
+            support_data_loader = self.train_dataset_loader
+
+        if self.is_test_mini_batch:
+            if self.same_mini_batch:
+                query_data_loader = self.gen_test_batchs_use_same_batch()
+            else:
+                query_data_loader = self.gen_test_batchs()
+        else:
+            query_data_loader = self.test_dataset_loader
         # 这里觉得必须是有 adapt 的过程
         self.model.eval()
-        learner = self.model.clone()
         # 清空目前指向的参数的梯度信息
         # 记录相关的信息
         support_loss, support_correct, support_num_sample = 0.0, 0, 0
-        for batch_idx, (x, y) in enumerate(train_loader):
+        loss_sum = 0.0
+        for batch_idx, (x, y) in enumerate(support_data_loader):
             x, y = x.to(self.device), y.to(self.device)
             num_sample = y.size(0)
-            pred = learner(x)
+            pred = self.model(x)
             loss = self.criterion(pred, y)
             # 评估
             correct = self.count_correct(pred, y)
@@ -250,17 +267,23 @@ class Client(BaseClient):
             support_loss += loss.item() * num_sample
             support_correct += correct
             support_num_sample += num_sample
+            loss_sum += loss * num_sample
             # 计算 loss 关于当前参数的导数, 并更新目前网络的参数
-            learner.adapt(loss)
+        grads = torch.autograd.grad(loss_sum / support_num_sample, list(self.model.parameters()), create_graph=True, retain_graph=True)
+        for p, g in zip(self.model.parameters(), grads):
+            p.data.add_(g.data, alpha=-self.inner_lr)
+        for p in self.model.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
 
         # 此使的参数基于 query
         query_loss, query_correct, query_num_sample = 0.0, 0, 0
 
         with torch.no_grad():
-            for batch_idx, (x, y) in enumerate(test_loader):
+            for batch_idx, (x, y) in enumerate(query_data_loader):
                 x, y = x.to(self.device), y.to(self.device)
                 num_sample = y.size(0)
-                pred = learner(x)
+                pred = self.model(x)
                 loss = self.criterion(pred, y)
                 # batch_sum_loss
                 # 评估
@@ -272,40 +295,6 @@ class Client(BaseClient):
 
         return support_loss, support_correct, support_num_sample, query_loss, query_correct, query_num_sample
 
-    def generate_batch_generator(self, dataloader):
-        # 返回 dataloader 的迭代器
-        return iter(dataloader)
-
-    def gen_train_batchs(self):
-        """
-        产生基于 dataloader 的若干的 mini-batch
-        引用: https://github.com/pytorch/pytorch/issues/1917#issuecomment-433698337
-        :param dataloader:
-        :param mini_batch_gen_size: 产生多少次?
-        :return:
-        """
-        for i in range(self.meta_inner_step):
-            try:
-                data, target = next(self.train_dataset_loader_iterator)
-            except StopIteration:
-                self.train_dataset_loader_iterator = self.generate_batch_generator(self.train_dataset_loader)
-                data, target = next(self.train_dataset_loader_iterator)
-            yield data, target
-
-    def gen_test_batchs(self):
-        """
-        产生基于 dataloader 的若干的 mini-batch
-        :param dataloader:
-        :param mini_batch_gen_size: 产生多少次?
-        :return:
-        """
-        for i in range(self.meta_inner_step):
-            try:
-                data, target = next(self.test_dataset_loader_iterator)
-            except StopIteration:
-                self.test_dataset_loader_iterator = self.generate_batch_generator(self.test_dataset_loader)
-                data, target = next(self.test_dataset_loader_iterator)
-            yield data, target
 
 
 class FedMeta(BaseFedarated):
@@ -313,21 +302,27 @@ class FedMeta(BaseFedarated):
     def __init__(self, options, model, read_dataset, more_metric_to_train=None):
         self.meta_algo = options['meta_algo']
         self.outer_lr = options['outer_lr']
-        self.meta_inner_step = options['meta_inner_step']
+        self.meta_train_inner_step = options['train_inner_step']
+        self.meta_test_inner_step = options['test_inner_step']
         self.meta_train_test_split = options['meta_train_test_split']
         self.store_to_cpu = options['store_to_cpu']
         self.outer_opt = Adam(lr=self.outer_lr)
 
-        if self.meta_inner_step <= 0:
-            print('>>> Using FedMeta')
-        else:
-            print('>>> Using FedMeta, meta-train inner step: ', self.meta_inner_step)
-        if self.meta_inner_step > 0:
-            a = f'outerlr[{self.outer_lr}]_metaalgo[{self.meta_algo}]_minibatch[{self.meta_inner_step}]'
-        else:
+        # assert not ((self.meta_test_inner_step == 0) ^ (self.meta_train_inner_step == 0)), '同时设置或者都不设置'
+        if self.meta_train_inner_step <= 0:
+            print('>>> Using FedMeta', end=' ')
             a = f'outerlr[{self.outer_lr}]_metaalgo[{self.meta_algo}]'
-        self.maml = MAML(lr=options['lr'], model=model.to(options['device']))
-        super(FedMeta, self).__init__(options=options, model=self.maml, read_dataset=read_dataset, append2metric=a,
+        else:
+            print('>>> Using FedMeta, meta-train support inner step: ', self.meta_train_inner_step, ', query inner step', self.meta_test_inner_step, end=' ')
+            a = f'outerlr[{self.outer_lr}]_metaalgo[{self.meta_algo}]_trainstep[{self.meta_train_inner_step}]_teststep[{self.meta_test_inner_step}]'
+
+        if options['same_mini_batch']:
+            print(', use same mini-batch for inner step')
+            a += '_usesameminibatch'
+        else:
+            print()
+        # self.maml = MAML(lr=options['lr'], model=model.to(options['device']))
+        super(FedMeta, self).__init__(options=options, model=model, read_dataset=read_dataset, append2metric=a,
                                       more_metric_to_train=['query_acc', 'query_loss'])
         # 拆分客户端
         self.split_train_validation_test_clients()
@@ -336,10 +331,11 @@ class FedMeta(BaseFedarated):
 
     def setup_model(self, options, model):
         dev = options['device']
-        input_shape = model.module.input_shape
-        input_type = model.module.input_type if hasattr(model.module, 'input_type') else None
+        model = model.to(dev)
+        input_shape = model.input_shape
+        input_type = model.input_type if hasattr(model, 'input_type') else None
         self.flops, self.params_num, self.model_bytes = \
-            get_model_complexity_info(model.module, input_shape, input_type=input_type, device=dev)
+            get_model_complexity_info(model, input_shape, input_type=input_type, device=dev)
         return model
 
     def split_train_validation_test_clients(self, train_rate=0.8, val_rate=0.1):
@@ -378,7 +374,7 @@ class FedMeta(BaseFedarated):
             #     user_id = int(user)
             tr = dataset_wrapper(train_data[user], options=self.options)
             te = dataset_wrapper(test_data[user], options=self.options)
-            c = Client(id=user, options=self.options, train_dataset=tr, test_dataset=te, optimizer=None, model=self.maml, model_flops=self.flops, model_bytes=self.model_bytes)
+            c = Client(id=user, options=self.options, train_dataset=tr, test_dataset=te, optimizer=None, model=self.model, model_flops=self.flops, model_bytes=self.model_bytes)
             all_clients.append(c)
         return all_clients
 
@@ -395,7 +391,7 @@ class FedMeta(BaseFedarated):
         qry_corr, qry_loss, qry_sz = 0, 0.0, 0
         for c in clients:
             c.set_parameters_list(self.latest_model)
-            support_loss, support_correct, support_num_sample, query_loss, query_correct, query_num_sample = c.test_meta_one_epoch(c.train_dataset_loader, c.test_dataset_loader)
+            support_loss, support_correct, support_num_sample, query_loss, query_correct, query_num_sample = c.test_meta_one_epoch()
             spt_corr += support_correct
             spt_loss += support_loss
             spt_sz += support_num_sample
@@ -429,7 +425,7 @@ class FedMeta(BaseFedarated):
         qry_sz, spt_sz = 0, 0
 
         solns = []
-        num_qry_size = []
+        num_size = []
         for c in clients:
             c.set_parameters_list(self.latest_model)
             # 保存信息
@@ -446,7 +442,7 @@ class FedMeta(BaseFedarated):
             #
             spt_sz += stat['support_num_samples']
             qry_sz += stat['query_num_samples']
-            num_qry_size.append(stat['query_num_samples'])
+            num_size.append(stat['query_num_samples'] + stat['support_loss_sum'])
             solns.append(grads)
             # 写入测试的相关信息
             self.metrics.update_commu_stats(round_i, flop_stat)
@@ -463,7 +459,7 @@ class FedMeta(BaseFedarated):
             print(f'mean qry loss: {mean_qry_loss:.5f}, mean qry acc: {mean_qry_acc:.3%}')
 
         self.metrics.update_train_stats_only_acc_loss(round_i, stats)
-        return solns, num_qry_size
+        return solns, num_size
 
     def aggregate_grads_simple(self, solns, lr, weights_before):
         # 使用 adam

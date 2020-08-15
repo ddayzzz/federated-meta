@@ -97,12 +97,9 @@ def base_options():
                         help='加载的数据格式, json 为 Leaf以及Li T.等人定义的格式, 默认为 pkl',
                         type=str,
                         default='pkl')
-
-    # FedAvg Scheme
-    parser.add_argument('--scheme',
-                        help='Scheme 1;Scheme 2;Transformed scheme 2',
-                        type=str,
-                        default='')
+    parser.add_argument('--train_inner_step', default=0, type=int)
+    parser.add_argument('--test_inner_step', default=0, type=int)
+    parser.add_argument('--same_mini_batch', action='store_true', default=False)
     return parser
 
 
@@ -116,9 +113,9 @@ def add_dynamic_options(argparser):
         argparser.add_argument('--meta_algo', help='使用的元学习算法, 默认 maml', type=str, default='maml',
                                choices=['maml', 'reptile', 'meta_sgd'])
         argparser.add_argument('--outer_lr', help='更新元学习中的外部学习率', type=float, required=True)
-        argparser.add_argument('--meta_inner_step', type=int, default=0)
         argparser.add_argument('--meta_train_test_split', type=int, default=-1)
         argparser.add_argument('--store_to_cpu', action='store_true', default=False)
     elif algo == 'fedavg_adv':
         argparser.add_argument('--use_all_data', action='store_true', default=False)
+
     return argparser
